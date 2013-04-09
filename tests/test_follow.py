@@ -6,8 +6,8 @@ import shutil
 import time
 import config_test
 
-from jobTree.scriptTree.target import Target
-from jobTree.scriptTree.stack import Stack
+from sparkTree import Target
+from sparkTree import Stack
 
 class Child_wait(Target):
     def run(self):
