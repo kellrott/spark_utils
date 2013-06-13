@@ -1,0 +1,310 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import re
+import drmaa
+import tempfile
+import subprocess
+import argparse
+import time
+from glob import glob
+import sys, os, time, atexit
+from signal import SIGTERM, SIGINT
+import socket
+
+job_template = """#!/bin/bash
+#$ -S /bin/bash
+
+export SCALA_HOME=%s
+
+./run spark.deploy.worker.Worker %s
+"""
+
+re_conf = re.compile(r'^(\w+)\s*=\s*(.*)$')
+
+def read_config(path):
+    handle = open(path)
+    out = {}
+    for line in handle:
+        res = re_conf.search(line)
+        gr = res.groups()
+        out[gr[0]] = gr[1]
+    return out
+    
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('cmd',help="Command")
+    parser.add_argument("-c", "--config", default="~/.sparkutil/config")
+    parser.add_argument("-w", "--workdir", default="~/.sparkutil/work")
+    parser.add_argument("-l", "--logdir", default="~/.sparkutil/log")
+    parser.add_argument("-p", "--pid", default="~/.sparkutil/master.pid")
+    
+    parser.add_argument('-n', '--worker-count', help='Number of Spark Workers', type=int, default=10)
+   
+    args = parser.parse_args()
+    args.config = os.path.abspath(os.path.expanduser(args.config))
+    args.workdir = os.path.abspath(os.path.expanduser(args.workdir))
+    args.logdir = os.path.abspath(os.path.expanduser(args.logdir))
+    args.pid = os.path.abspath(os.path.expanduser(args.pid))
+    
+    if not os.path.exists(args.config):
+        config = {}
+    else:
+        config = read_config(args.config)
+    
+    if 'SPARK_HOME' not in config:
+        print "Define SPARK_HOME in %s" % (args.config)
+        sys.exit(1)
+
+    if 'SCALA_HOME' not in config:
+        print "Define SCALA_HOME in %s" % (args.config)
+        sys.exit(1)
+
+    if 'SERVER_PORT' not in config:
+        config['SERVER_PORT'] = str(os.geteuid() * 10)
+    if 'WEB_PORT' not in config:
+        config['WEB_PORT'] = str(os.geteuid() * 10 + 1)
+    if 'SERVER_HOST' not in config:
+        config['SERVER_HOST'] = str(socket.gethostname())
+    config['LOG_DIR'] = args.logdir
+    
+    if not os.path.exists(args.workdir):
+        os.makedirs(args.workdir)
+
+    if not os.path.exists(args.logdir):
+        os.makedirs(args.logdir)
+
+    daemon = SparkDeamon(args.pid)    
+    daemon.config = config
+    if 'start' == args.cmd:
+        print "Starting servers"
+        print "spark://%s:%s" % (config['SERVER_HOST'], config['SERVER_PORT'])
+        print "http://%s:%s" % (config['SERVER_HOST'], config['WEB_PORT'])
+        daemon.start()
+    elif 'stop' == args.cmd:
+        daemon.stop()
+    elif 'restart' == args.cmd:
+        daemon.restart()
+    elif 'add' == args.cmd:
+        worker_jobs = []
+        s=drmaa.Session()
+        s.initialize()
+        jt = s.createJobTemplate()
+    
+        for i in range(args.worker_count):
+            handle, path = tempfile.mkstemp(dir=args.workdir, prefix="spark_worker.")
+            server_url = "spark://%s:%s" % (config['SERVER_HOST'], config['SERVER_PORT'])
+            os.write(handle, job_template % (config['SCALA_HOME'], server_url))
+            os.close(handle)
+            os.chmod( path, 0755 )
+        
+            jt.workingDirectory = config['SPARK_HOME']
+            jt.remoteCommand = os.path.abspath(path)
+            jt.args = []
+            if 'QUEUE_CONFIG' in config:
+                jt.nativeSpecification = config['QUEUE_CONFIG']
+            jt.jobEnvironment = os.environ
+            jt.outputPath= ":" + os.path.abspath(path) + ".out"
+            jt.errorPath= ":" + os.path.abspath(path) + ".err"
+            #jt.joinFiles=True
+        
+            jobid = s.runJob(jt)
+            handle = open( os.path.join(args.workdir, "spark_jid.%s" % (jobid)), "w" )
+            handle.write(path)
+            handle.close()
+            print 'Your job has been submitted with id ' + jobid
+            worker_jobs.append(jobid)
+        s.deleteJobTemplate(jt)
+        s.exit()
+
+    elif 'clean' == args.cmd:
+        print 'Cleaning up'
+        s=drmaa.Session()
+        s.initialize()
+        
+        for path in glob(os.path.join(args.workdir, "spark_jid.*")):
+            jid = re.sub(r'^spark_jid.', '', os.path.basename(path))
+            print jid
+            try:
+                s.control(jid, drmaa.JobControlAction.TERMINATE)
+            except drmaa.errors.InvalidJobException:
+                pass
+            handle = open(path)
+            workfilebase = handle.readline()
+            handle.close()
+            try:
+                os.unlink(workfilebase)
+            except OSError:
+                pass
+            try:
+                os.unlink(workfilebase + ".err")
+            except OSError:
+                pass
+            try:
+                os.unlink(workfilebase + ".out")
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            
+        
+        #for jobid in worker_jobs:
+        #    s.control(jobid, drmaa.JobControlAction.TERMINATE)
+        #s.deleteJobTemplate(jt)
+        #s.exit()
+
+ 
+class Daemon:
+    """
+    daemon code from: http://www.jejik.com/articles/2007/02/a_simple_unix_linux_daemon_in_python/
+    A generic daemon class.
+   
+    Usage: subclass the Daemon class and override the run() method
+    """
+    def __init__(self, pidfile, stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pidfile = pidfile
+
+    def daemonize(self):
+        """
+        do the UNIX double-fork magic, see Stevens' "Advanced
+        Programming in the UNIX Environment" for details (ISBN 0201563177)
+        http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+        """
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit first parent
+                sys.exit(0)
+        except OSError, e:
+            sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        # decouple from parent environment
+        os.chdir("/")
+        os.setsid()
+        os.umask(0)
+
+        # do second fork
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit from second parent
+                sys.exit(0)
+        except OSError, e:
+            sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        # redirect standard file descriptors
+        sys.stdout.flush()
+        sys.stderr.flush()
+        si = file(self.stdin, 'r')
+        so = file(self.stdout, 'a+')
+        se = file(self.stderr, 'a+', 0)
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+
+        # write pidfile
+        atexit.register(self.delpid)
+        pid = str(os.getpid())
+        file(self.pidfile,'w+').write("%s\n" % pid)
+
+    def delpid(self):
+        os.remove(self.pidfile)
+
+    def start(self):
+        """
+        Start the daemon
+        """
+        # Check for a pidfile to see if the daemon already runs
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+
+        if pid:
+            message = "pidfile %s already exist. Daemon already running?\n"
+            sys.stderr.write(message % self.pidfile)
+            sys.exit(1)
+       
+        # Start the daemon
+        self.daemonize()
+        self.run()
+
+    def stop(self):
+        """
+        Stop the daemon
+        """
+        # Get the pid from the pidfile
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+
+        if not pid:
+            message = "pidfile %s does not exist. Daemon not running?\n"
+            sys.stderr.write(message % self.pidfile)
+            return # not an error in a restart
+
+        # Try killing the daemon process       
+        try:
+            while 1:
+                os.kill(pid, SIGINT)
+                time.sleep(0.1)
+        except OSError, err:
+            err = str(err)
+            if err.find("No such process") > 0:
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+            else:
+                print str(err)
+                sys.exit(1)
+
+    def restart(self):
+        """
+        Restart the daemon
+        """
+        self.stop()
+        self.start()
+
+    def run(self):
+        """
+        You should override this method when you subclass Daemon. It will be called after the process has been
+        daemonized by start() or restart().
+        """
+        pass
+
+class SparkDeamon(Daemon):
+    
+    def run(self):
+        cmd = [
+            os.path.join(self.config['SPARK_HOME'], "run"),
+            "spark.deploy.master.Master",
+            "-p", self.config['SERVER_PORT'],
+            "--webui-port", self.config['WEB_PORT']
+        ]
+        os.environ['SCALA_HOME'] = self.config['SCALA_HOME']
+        out_handle = open( os.path.join(self.config['LOG_DIR'], "master_out"), "w")
+        err_handle = open( os.path.join(self.config['LOG_DIR'], "master_err"), "w")
+        try:
+            proc = subprocess.Popen(cmd, stdout=out_handle, stderr=err_handle)
+            proc.communicate()
+        except:
+            pass
+        proc.kill()
+
+if __name__ == "__main__":
+    main()
+    print "Exiting"
+    
+
